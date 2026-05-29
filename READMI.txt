@@ -1,3 +1,5 @@
+Works only directory C:\Tools !!! ist important
+
 Summary of Changes (compared to the first server version)
 1. New Features
 Office Editor (mcp_office_editor):
