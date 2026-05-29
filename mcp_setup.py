@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP Setup Helper v6.7 – гибридная установка: offline + online fallback
+MCP Setup Helper v6.9 – гибридная установка с автоматическим переключением зеркал,
+увеличенными таймаутами и поддержкой обновления pip/setuptools через зеркала.
 """
+
 import os
 import sys
 import ast
@@ -10,6 +12,7 @@ import json
 import shutil
 import subprocess
 import argparse
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -26,12 +29,18 @@ BASE_DEPS = {
     "patool", "py7zr", "rarfile", "playwright", "pandas",
     "sentence-transformers", "chromadb", "pypdf", "pdfplumber", "ebooklib",
     "trafilatura", "readability-lxml", "html-table-takeout",
-    "mempalace"   # <-- добавлено
+    "mempalace"
 }
 
+# Список зеркал PyPI (в порядке приоритета)
+PIP_MIRRORS = [
+    "",   # официальный PyPI (без --index-url)
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://mirrors.aliyun.com/pypi/simple/",
+    "https://mirrors.cloud.tencent.com/pypi/simple",
+]
 
 def find_plugin_deps():
-    """Парсит __mcp_plugin__ = {'dependencies': [...]} из .py файлов."""
     deps = set()
     for search_dir in [ROOT, ROOT / "mcp_plugins"]:
         if not search_dir.is_dir():
@@ -60,14 +69,12 @@ def find_plugin_deps():
                 print(f"⚠️ Предупреждение: {py_file.name}: {e}")
     return deps
 
-
 def get_full_deps():
     return sorted(BASE_DEPS | find_plugin_deps())
 
-
-def run(cmd, check=False):
+def run(cmd, check=False, env=None, timeout=120):
     print(f">>> {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
     if proc.stdout:
         print(proc.stdout)
     if proc.stderr:
@@ -75,7 +82,6 @@ def run(cmd, check=False):
     if check and proc.returncode != 0:
         sys.exit(proc.returncode)
     return proc
-
 
 def ensure_venv():
     if not VENV.exists():
@@ -85,7 +91,6 @@ def ensure_venv():
         print(f"❌ Ошибка: {PY_EXE} не найден")
         sys.exit(1)
 
-
 def check_pip():
     result = subprocess.run([PY_EXE, "-m", "pip", "--version"], capture_output=True)
     if result.returncode != 0:
@@ -94,9 +99,7 @@ def check_pip():
         sys.exit(1)
     return True
 
-
 def check_import(package: str) -> bool:
-    """Проверяет, импортируется ли пакет. С защитой от инъекций."""
     import_name = package.split('[')[0].replace('-', '_')
     mapping = {
         "beautifulsoup4": "bs4",
@@ -120,30 +123,73 @@ def check_import(package: str) -> bool:
     try:
         subprocess.run(
             [PY_EXE, "-c", f"import {import_name}"],
-            capture_output=True, check=True, text=True
+            capture_output=True, check=True, text=True, timeout=30
         )
         return True
     except subprocess.CalledProcessError:
         return False
 
+def install_with_mirrors(packages, upgrade=False, timeout=120):
+    if not packages:
+        return True
+    cmd_base = PIP_CMD + (["install", "--upgrade"] if upgrade else ["install"])
+    cmd_base += ["--timeout", str(timeout)]
+    for mirror in PIP_MIRRORS:
+        cmd = cmd_base.copy()
+        if mirror:
+            cmd += ["--index-url", mirror]
+        cmd += packages
+        print(f"🌐 Пробую зеркало: {mirror or 'официальный PyPI'}")
+        proc = run(cmd, timeout=timeout)
+        if proc.returncode == 0:
+            return True
+        print(f"⚠️ Зеркало {mirror or 'официальный'} недоступно, пробую следующее...")
+        time.sleep(2)
+    return False
+
+def download_with_mirrors(packages, timeout=120):
+    if not packages:
+        return True
+    DEPS_DIR.mkdir(exist_ok=True)
+    for mirror in PIP_MIRRORS:
+        cmd = PIP_CMD + ["download", "-d", str(DEPS_DIR), "--prefer-binary", "--timeout", str(timeout)]
+        if mirror:
+            cmd += ["--index-url", mirror]
+        cmd += packages
+        print(f"🌐 Скачиваю через зеркало: {mirror or 'официальный PyPI'}")
+        proc = run(cmd, timeout=timeout)
+        if proc.returncode == 0:
+            return True
+        print(f"⚠️ Зеркало {mirror or 'официальный'} недоступно, пробую следующее...")
+        time.sleep(2)
+    return False
+
+def ensure_playwright_browsers():
+    try:
+        subprocess.run([PY_EXE, "-m", "playwright", "install", "chromium"],
+                       capture_output=True, check=True, timeout=300)
+        print("✅ Браузеры Playwright установлены.")
+    except subprocess.CalledProcessError:
+        print("⚠️ Не удалось автоматически установить браузеры Playwright.")
+        print("   Запустите позже: %PY_EXE% -m playwright install chromium")
+    except FileNotFoundError:
+        pass
 
 def check_and_install_missing():
-    """Гибридная установка: offline для локальных .whl, online для остальных."""
     ensure_venv()
     check_pip()
     deps = get_full_deps()
     missing = [dep for dep in deps if not check_import(dep)]
     if not missing:
         print("✅ Все зависимости уже установлены.")
+        ensure_playwright_browsers()
         return
     print(f"⚠️ Отсутствуют {len(missing)} пакетов: {', '.join(missing)}")
     print("🔧 Устанавливаю недостающие пакеты...")
 
-    # Определяем, какие пакеты есть в локальной папке python_deps
     local_whls = set()
     if DEPS_DIR.exists():
         for whl in DEPS_DIR.glob("*.whl"):
-            # Имя пакета из файла: mempalace-0.1.0-py3-none-any.whl -> mempalace
             pkg_name = whl.stem.split('-')[0].lower()
             local_whls.add(pkg_name)
 
@@ -155,45 +201,39 @@ def check_and_install_missing():
         else:
             online_pkgs.append(pkg)
 
-    # Установка из локальной папки (offline)
     if offline_pkgs:
         print(f"📦 Устанавливаю из локальной папки: {', '.join(offline_pkgs)}")
         cmd = PIP_CMD + ["install", "--no-index", "--find-links", str(DEPS_DIR),
                          "--no-build-isolation"] + offline_pkgs
-        result = run(cmd)
-        if result.returncode != 0:
+        if run(cmd).returncode != 0:
             print("❌ Ошибка при установке из локальной папки.")
             sys.exit(1)
 
-    # Установка из интернета (online)
     if online_pkgs:
         print(f"🌐 Устанавливаю из интернета: {', '.join(online_pkgs)}")
-        cmd = PIP_CMD + ["install", "--prefer-binary"] + online_pkgs
-        result = run(cmd)
-        if result.returncode != 0:
-            print("❌ Ошибка при установке из интернета.")
+        if not install_with_mirrors(online_pkgs, timeout=120):
+            print("❌ Ошибка при установке из интернета (все зеркала недоступны).")
             sys.exit(1)
 
-    print("✅ Недостающие зависимости успешно установлены.")
-
+    ensure_playwright_browsers()
+    print("✅ Все зависимости успешно установлены.")
 
 def online_mode():
     ensure_venv()
     check_pip()
     deps = get_full_deps()
     print(f"🌐 Скачиваю {len(deps)} пакетов...")
-    run(PIP_CMD + ["install", "--upgrade", "pip", "setuptools", "wheel"], check=True)
-    DEPS_DIR.mkdir(exist_ok=True)
-    cmd = PIP_CMD + ["download", "-d", str(DEPS_DIR), "--prefer-binary"] + deps
-    result = run(cmd)
-    if result.returncode != 0:
-        print("❌ Ошибка при скачивании")
+    # Обновляем pip и setuptools через зеркала
+    if not install_with_mirrors(["pip", "setuptools", "wheel"], upgrade=True, timeout=120):
+        print("❌ Не удалось обновить pip/setuptools/wheel (все зеркала недоступны)")
         sys.exit(1)
-    run(PIP_CMD + ["download", "-d", str(DEPS_DIR), "--prefer-binary",
-                   "pip", "setuptools", "wheel"])
+    if not download_with_mirrors(deps):
+        print("❌ Ошибка при скачивании пакетов")
+        sys.exit(1)
+    # Дополнительно скачиваем pip/setuptools/wheel
+    download_with_mirrors(["pip", "setuptools", "wheel"])
     print(f"✅ Пакеты скачаны в {DEPS_DIR}")
     print("Запустите mcp_setup.py --offline для установки.")
-
 
 def offline_mode():
     if not DEPS_DIR.exists() or not any(DEPS_DIR.glob("*.whl")):
@@ -205,27 +245,18 @@ def offline_mode():
     print(f"📦 Устанавливаю {len(deps)} пакетов из {DEPS_DIR}...")
     upgrade_cmd = PIP_CMD + ["install", "--no-index", "--find-links", str(DEPS_DIR),
                              "--upgrade", "pip", "setuptools", "wheel"]
-    run(upgrade_cmd, check=True)
+    if run(upgrade_cmd).returncode != 0:
+        print("❌ Ошибка при обновлении pip")
+        sys.exit(1)
     install_cmd = PIP_CMD + ["install", "--no-index", "--find-links", str(DEPS_DIR),
                              "--no-build-isolation"] + deps
-    run(install_cmd, check=True)
-    print("🎭 Устанавливаю браузеры Playwright...")
-    playwright_install = subprocess.run(
-        [PY_EXE, "-m", "playwright", "install", "chromium"],
-        capture_output=True, text=True
-    )
-    if playwright_install.returncode != 0:
-        print("⚠️ Не удалось установить браузеры Playwright автоматически.")
-        print("   В offline-среде скопируйте папку %LOCALAPPDATA%\\ms-playwright")
-        print("   с онлайн-машины, либо запустите:")
-        print(f"   {PY_EXE} -m playwright install chromium")
-    else:
-        print("✅ Браузеры Playwright установлены.")
+    if run(install_cmd).returncode != 0:
+        print("❌ Ошибка при установке пакетов")
+        sys.exit(1)
+    ensure_playwright_browsers()
     print("✅ Зависимости установлены.")
 
-
 def fix_config(config_path: str, python_exe: str):
-    """Безопасно заменяет все значения "command": "python*" на python_exe в JSON-конфиге."""
     config_file = Path(config_path)
     if not config_file.exists():
         print(f"❌ Файл не найден: {config_path}")
@@ -280,7 +311,6 @@ def fix_config(config_path: str, python_exe: str):
             return 1
     return 0
 
-
 def main():
     parser = argparse.ArgumentParser(description="MCP Setup Helper")
     group = parser.add_mutually_exclusive_group(required=False)
@@ -308,7 +338,6 @@ def main():
         check_and_install_missing()
     else:
         parser.print_help()
-
 
 if __name__ == "__main__":
     main()
